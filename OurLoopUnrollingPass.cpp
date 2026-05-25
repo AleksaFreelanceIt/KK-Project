@@ -124,36 +124,57 @@ void fullUnrolling1(Loop *L) {
 
     std::vector<Instruction *> LoopInstructions;
     std::unordered_map<Value *, Value *> Mapping;
-    std::unordered_map<Value *, Value *> LoadMapping;
     Instruction *Copy;
+    LoadInst *CounterLoad = nullptr;
 
     BasicBlock *LoopBody = LoopBasicBlocks[1]; // kada radimo sa samo jednim basic blockom
 
-    for(Instruction &I : *LoopBody) {
-        if(!I.isTerminator()) {
+    for (Instruction &I : *LoopBody) {
+        if (!I.isTerminator()) {
             LoopInstructions.push_back(&I);
+            if (!CounterLoad) {
+                if (auto *LI = dyn_cast<LoadInst>(&I)) {
+                    if (LI->getOperand(0) == LoopCounter)
+                        CounterLoad = LI;
+                }
+            }
         }
     }
 
-    for(int i = 0; i < BoundValue; i++) {
-        for(Instruction *I : LoopInstructions) {
+    Value *BaseCounter = nullptr;
+    if (CounterLoad) {
+        IRBuilder<> Builder(L->getLoopPreheader()->getTerminator());
+        BaseCounter = Builder.CreateLoad(CounterLoad->getType(), LoopCounter);
+    }
+
+    for (int i = 0; i < BoundValue; i++) {
+        Value *IterationCounter = nullptr;
+        for (Instruction *I : LoopInstructions) {
+            if (auto *LI = dyn_cast<LoadInst>(I)) {
+                if (LI->getOperand(0) == LoopCounter && BaseCounter) {
+                    if (!IterationCounter) {
+                        if (i == 0) {
+                            IterationCounter = BaseCounter;
+                        } else {
+                            IterationCounter = BinaryOperator::CreateAdd(
+                                BaseCounter,
+                                ConstantInt::get(BaseCounter->getType(), i)
+                            );
+                            cast<Instruction>(IterationCounter)->insertBefore(LoopBody->getTerminator());
+                        }
+                    }
+                    Mapping[I] = IterationCounter;
+                    continue;
+                }
+            }
+
             Copy = I->clone();
             Copy->insertBefore(LoopBody->getTerminator());
-
-            if(isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(Copy, ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
-
-                Add->insertAfter(Copy);
-                LoadMapping[Copy] = Add;
-            }
             Mapping[I] = Copy;
 
-            for(size_t j = 0; j < Copy->getNumOperands(); j++) {
-                if(Mapping.find(Copy->getOperand(j)) != Mapping.end()) {
+            for (size_t j = 0; j < Copy->getNumOperands(); j++) {
+                if (Mapping.find(Copy->getOperand(j)) != Mapping.end()) {
                     Copy->setOperand(j, Mapping[Copy->getOperand(j)]);
-                }
-                if(LoadMapping.find(Copy->getOperand(j)) != LoadMapping.end()) {
-                    Copy->setOperand(j, LoadMapping[Copy->getOperand(j)]);
                 }
             }
         }
@@ -164,7 +185,7 @@ void fullUnrolling1(Loop *L) {
     L->getLoopPreheader()->getTerminator()->setSuccessor(0, L->getExitBlock()); // preheader sad treba da pokazuje na prvi basic block van granica pretlje
 
     // brisemo petlju jer nam ne treba vise
-    for(BasicBlock *BB : LoopBasicBlocks) {
+    for (BasicBlock *BB : LoopBasicBlocks) {
         BB->eraseFromParent();
     }
 }
@@ -234,21 +255,47 @@ void duplicateLoopBody(std::vector<BasicBlock*> LoopBodyBasicBlocks, int numOfTi
 
 // kada imamo vise basic blockova
 void fullUnrolling(Loop *L) {
+    BasicBlock *Preheader = L->getLoopPreheader();
+    BasicBlock *Exit = L->getExitBlock();
+    Instruction *OldTerm = Preheader->getTerminator();
+    Instruction *InsertPt = OldTerm;
+
+    std::vector<BasicBlock*> LoopBodyBlocks;
     if (LoopBasicBlocks.size() == 1) {
-        fullUnrolling1(L);
-        return;
+        LoopBodyBlocks.push_back(LoopBasicBlocks[0]);
+    } else {
+        std::copy(LoopBasicBlocks.begin() + 1, LoopBasicBlocks.end(), std::back_inserter(LoopBodyBlocks));
     }
 
-    std::vector<BasicBlock*> LoopBodyBasicBlocks(LoopBasicBlocks.size()-2);
-    std::copy(LoopBasicBlocks.begin()+1, LoopBasicBlocks.end()-1, LoopBodyBasicBlocks.begin());
+    for (int i = 0; i < BoundValue; ++i) {
+        std::unordered_map<Value *, Value *> Mapping;
 
-    L->getLoopPreheader()->getTerminator()->setSuccessor(0, LoopBodyBasicBlocks.front());
-    LoopBasicBlocks[LoopBasicBlocks.size()-2]->getTerminator()->setSuccessor(0, L->getExitBlock());
-    LoopBasicBlocks.front()->eraseFromParent();
-    LoopBasicBlocks.back()->eraseFromParent();
+        for (BasicBlock *BB : LoopBodyBlocks) {
+            for (Instruction &I : *BB) {
+                if (I.isTerminator())
+                    continue;
 
-    duplicateLoopBody(LoopBodyBasicBlocks, BoundValue - 1, L->getExitBlock());
+                Instruction *Copy = I.clone();
+                Copy->insertBefore(InsertPt);
 
+                for (unsigned j = 0; j < Copy->getNumOperands(); ++j) {
+                    Value *Op = Copy->getOperand(j);
+                    if (Mapping.find(Op) != Mapping.end()) {
+                        Copy->setOperand(j, Mapping[Op]);
+                    }
+                }
+
+                Mapping[&I] = Copy;
+            }
+        }
+    }
+
+    BranchInst::Create(Exit, Preheader);
+    OldTerm->eraseFromParent();
+
+    for (BasicBlock *BB : LoopBasicBlocks) {
+        BB->eraseFromParent();
+    }
 }
 
 // kada imamo jedan basic block
