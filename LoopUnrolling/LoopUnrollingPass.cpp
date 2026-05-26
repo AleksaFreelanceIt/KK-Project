@@ -192,9 +192,9 @@ void fullUnrolling1(Loop *L) {
 // prvo brisemo basic block koji predstavlja provjeru uslova i basic block koji skace na pocetak petlje i azurira brojac
 // ostaju nam oni koji predstavljaju tijelo petlje i n-1 put ga kopiramo
 // poslednji basic block treba da pokazuje na exit basic block i svaki block treba da pokazuje na pocetak narednog
-void duplicateLoopBody(std::vector<BasicBlock *> LoopBodyBasicBlocks, int numOfTimes, BasicBlock *InsertBefore) {
+void duplicateLoopBody(std::vector<BasicBlock *> LoopBodyBasicBlocks, int numOfTimes, BasicBlock *InsertBefore) { // InsertBefore prosljedjujemo da znamo gdje treba posljednja instrukcija da se preusmjeri (na izlaz)
     std::unordered_map<Value *, Value *> Mapping; // za mapiranje originalnih instrukcija u njihove kopije
-    std::unordered_map<Value *, Value *> LoadMapping; // kada imamo load loop brojaca da bi za svaku kopiju imali i+1, i+2,...
+    std::unordered_map<Value *, Value *> LoadMapping; // kada imamo load loop brojaca da bi za svaku kopiju imali i+1, i+2,... (kada u tijelu petlje imamo npr a[i]=i LoadMapping nam treba za to i)
     std::unordered_map<BasicBlock *, BasicBlock *> BlocksMapping; // mapiranje originalnih basic blockova u kopije
 
     IRBuilder<> Builder(InsertBefore->getContext()); // za ubacivanje novih instrukcija
@@ -228,7 +228,7 @@ void duplicateLoopBody(std::vector<BasicBlock *> LoopBodyBasicBlocks, int numOfT
                 Builder.Insert(Copy);
                 // pravljenje i+1, i+2,... ako je load loop brojaca
                 if(isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                    Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(Copy, 
+                    Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(Copy,
                                                        ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
                     Add->insertAfter(Copy); // ubacuje se odmah poslije load
                     LoadMapping[Copy] = Add; // zapamti mapiranje
@@ -314,7 +314,7 @@ void partialUnrolling1(Loop *L) {
             Copy->insertBefore(LoopBody->getTerminator());
 
             if(isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                Instruction *Add = (Instruction*) BinaryOperator::CreateAdd(Copy, 
+                Instruction *Add = (Instruction*) BinaryOperator::CreateAdd(Copy,
                                                   ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
 
                 Add->insertAfter(Copy);
@@ -429,9 +429,17 @@ void partialUnrolling(Loop *L) {
 
 void unrollLoop(Loop *L) {
     if(isLoopBoundConst) {
-        fullUnrolling1(L);
+		if(LoopBasicBlocks.size() == 3) {
+			fullUnrolling1(L);
+		} else {
+        	fullUnrolling(L);
+		}
     } else {
-        partialUnrolling(L);
+		if(LoopBasicBlocks.size() == 3) {
+			partialUnrolling1(L);
+		} else {
+        	partialUnrolling(L);
+		}
     }
 }
 
@@ -452,12 +460,44 @@ void debugPrintLoopInfo(Loop *L) {
     }
 }
 
+// pravimo pretpopstavku da ukoliko se brojac mijenja bilo gdje u petlji tada necemo da radimo unrolling
+bool isLoopCounterModifiedInBody(Loop *L, Value *LoopCounter) {
+	if(!LoopCounter) {
+		return false;
+	}
+	BasicBlock *Header = L->getHeader(); // uslov petlje
+	BasicBlock *Latch = L->getLoopLatch(); // i++
+
+	for(BasicBlock *BB : L->blocks()) {
+		if(BB == Header) { // necemo da gledamo header (provjera uslova)
+			continue;
+		}
+		if(BB == Latch) { // ovdje je i++ tkd necemo da prekidamo kada se tu mijenja
+			continue;
+		}
+
+		for(Instruction &I : *BB) {
+			if(auto *Store = dyn_cast<StoreInst>(&I)) {
+				Value *StoredAddress = Store->getPointerOperand(); // uzimamo adresu u koju store upisuje
+				if(StoredAddress == LoopCounter) { // ako se upisuje bas u memoriju LoopCountera znaci da se mijenja brojac u tijelu
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
     // LPM mi necemo koristiti ali se prosledjuje kao parametar
     bool runOnLoop(Loop *L, LPPassManager &LPM) override {
 
         LoopBasicBlocks = L->getBlocksVector();
         MapVariables(L);
         findLoopCounterAndBound(L);
+		if(isLoopCounterModifiedInBody(L, LoopCounter)) {
+			errs() << "Loop counter is modified inside loop body. Loop unrolling won't be done!\n";
+			exit(1);
+		}
         unrollLoop(L);
         //debugPrintLoopInfo(L);
         return true;
