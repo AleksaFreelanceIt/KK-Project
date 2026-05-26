@@ -1,6 +1,3 @@
-//
-// Created by andjela375 on 5/25/26.
-//
 #include "llvm/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Instructions.h"
@@ -46,7 +43,7 @@ struct LoopUnrollingPass : public LoopPass {
     }
 
     void findLoopCounterAndBound(Loop *L) {
-        // Reset the state before scanning.
+        // Resetuje promenjive pre pretrage
         LoopCounter = nullptr;
         isLoopBoundConst = false;
         BoundValue = 0;
@@ -231,7 +228,8 @@ void duplicateLoopBody(std::vector<BasicBlock *> LoopBodyBasicBlocks, int numOfT
                 Builder.Insert(Copy);
                 // pravljenje i+1, i+2,... ako je load loop brojaca
                 if(isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                    Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(Copy, ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
+                    Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(Copy, 
+                                                       ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
                     Add->insertAfter(Copy); // ubacuje se odmah poslije load
                     LoadMapping[Copy] = Add; // zapamti mapiranje
                 }
@@ -285,6 +283,9 @@ void fullUnrolling(Loop *L) {
     LoopBasicBlocks.back()->eraseFromParent(); // obrise poslednji blok
 }
 
+
+
+
 // kada imamo jedan basic block
 void partialUnrolling1(Loop *L) {
     std::vector<Instruction *> LoopInstructions;
@@ -303,12 +304,19 @@ void partialUnrolling1(Loop *L) {
     Instruction *Copy;
 
     for(int i = 0; i < Factor-1; i++) { // Factor - 1 jer vec postoji originalno tijelo petlje
+        // Očistimo mapiranje pre svake kopije da novi klon koristi vrednosti
+        // iz te kopije, a ne iz prethodnih unroldovanih iteracija.
+        Mapping.clear();
+        LoadMapping.clear();
+
         for(Instruction *I : LoopInstructions) {
             Copy = I->clone();
             Copy->insertBefore(LoopBody->getTerminator());
 
             if(isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                Instruction *Add = (Instruction*) BinaryOperator::CreateAdd(Copy, ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
+                Instruction *Add = (Instruction*) BinaryOperator::CreateAdd(Copy, 
+                                                  ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
+
                 Add->insertAfter(Copy);
                 LoadMapping[Copy] = Add;
             }
@@ -320,6 +328,24 @@ void partialUnrolling1(Loop *L) {
                 }
                 if(LoadMapping.find(Copy->getOperand(j)) != LoadMapping.end()) {
                     Copy->setOperand(j, LoadMapping[Copy->getOperand(j)]);
+                }
+            }
+        }
+    }
+    // Updejtujemo inkrement u latch bloku tako da petlja napreduje za Faktor umesto za 1.
+    if (BasicBlock *Latch = L->getLoopLatch()) {
+        for (Instruction &I : *Latch) {
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                if (BO->getOpcode() == Instruction::Add) {
+                    if (auto *LI = dyn_cast<LoadInst>(BO->getOperand(0))) {
+                        if (LI->getOperand(0) == LoopCounter) {
+                            if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+                                if (C->getSExtValue() == 1) {
+                                    BO->setOperand(1, ConstantInt::get(C->getType(), Factor));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -405,9 +431,10 @@ void unrollLoop(Loop *L) {
     if(isLoopBoundConst) {
         fullUnrolling1(L);
     } else {
-        partialUnrolling1(L);
+        partialUnrolling(L);
     }
 }
+
 //Debug f-ja
 void debugPrintLoopInfo(Loop *L) {
     errs() << "[OurUnroll] Running on loop in function: "
@@ -432,6 +459,7 @@ void debugPrintLoopInfo(Loop *L) {
         MapVariables(L);
         findLoopCounterAndBound(L);
         unrollLoop(L);
+        //debugPrintLoopInfo(L);
         return true;
     }
   };
