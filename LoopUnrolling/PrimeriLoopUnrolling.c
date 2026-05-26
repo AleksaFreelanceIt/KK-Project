@@ -36,5 +36,16 @@ for(int i = 0; i < 5; i++) {
     }
 }
 
+// i se menja u telu petlje - izbacuje poruku i ne radi unrolling
+
+for(int i = 0; i < n; i++) {
+    if(x % 2 == 0) {
+        x++;
+        i--;
+    } else {
+        a[i] = i;
+    }
+}
+
 return 0;
 }
