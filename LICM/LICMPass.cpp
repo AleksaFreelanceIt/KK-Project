@@ -1,22 +1,24 @@
 #include <unordered_set>
+#include <vector>
 
+#include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
-#include "llvm/Analysis/LoopPass.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/Pass.h"
-#include "llvm/Transforms/Utils.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Plugins/PassPlugin.h"
+#include "llvm/Transforms/Utils/LoopSimplify.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
 
 using namespace llvm;
 
 namespace
 {
 
-struct LICMPass : public LoopPass
+struct LICMPass : public PassInfoMixin<LICMPass>
 {
-    static char ID;
     static std::unordered_set<unsigned int> GoodInstructions;
-
-    LICMPass() : LoopPass(ID) {}
 
     std::unordered_set<Instruction*> findHoistableLoads(Loop* L)
     {
@@ -25,10 +27,7 @@ struct LICMPass : public LoopPass
         Module* M = L->getHeader()->getModule();
         for (GlobalVariable& GV : M->globals())
         {
-            if (!GV.isConstant())
-            {
-                UnhoistableLoads.insert(&GV);
-            }
+            if (!GV.isConstant()) UnhoistableLoads.insert(&GV);
         }
 
         for (BasicBlock* BB : L->blocks())
@@ -42,12 +41,7 @@ struct LICMPass : public LoopPass
                 else if (CallInst* CI = dyn_cast<CallInst>(&I))
                 {
                     for (Value* Arg : CI->args())
-                    {
-                        if (Arg->getType()->isPointerTy())
-                        {
-                            UnhoistableLoads.insert(Arg);
-                        }
-                    }
+                        if (Arg->getType()->isPointerTy()) UnhoistableLoads.insert(Arg);
                 }
                 else if (GetElementPtrInst* GEP = dyn_cast<GetElementPtrInst>(&I))
                 {
@@ -57,20 +51,10 @@ struct LICMPass : public LoopPass
         }
 
         std::unordered_set<Instruction*> HoistableLoads;
-
         for (BasicBlock* BB : L->blocks())
-        {
             for (Instruction& I : *BB)
-            {
                 if (LoadInst* LI = dyn_cast<LoadInst>(&I))
-                {
-                    if (UnhoistableLoads.count(LI->getPointerOperand()) == 0)
-                    {
-                        HoistableLoads.insert(LI);
-                    }
-                }
-            }
-        }
+                    if (UnhoistableLoads.count(LI->getPointerOperand()) == 0) HoistableLoads.insert(LI);
 
         return HoistableLoads;
     }
@@ -80,33 +64,13 @@ struct LICMPass : public LoopPass
     bool isHoistableInstruction(Instruction* I, std::unordered_set<Instruction*>& HoistableLoads,
                                 const std::unordered_set<Instruction*>& NotHoisted)
     {
-        if (LoadInst* LI = dyn_cast<LoadInst>(I))
-        {
-            return HoistableLoads.count(LI) == 1;
-        }
+        if (LoadInst* LI = dyn_cast<LoadInst>(I)) return HoistableLoads.count(LI) == 1;
 
-        if (!isGoodInstruction(I))
-        {
-            return false;
-        }
+        if (!isGoodInstruction(I)) return false;
 
         for (Value* Op : I->operands())
-        {
-            bool ShouldAdd = true;
-
             if (Instruction* OpInst = dyn_cast<Instruction>(Op))
-            {
-                if (NotHoisted.count(OpInst) == 1)
-                {
-                    ShouldAdd = false;
-                }
-            }
-
-            if (!ShouldAdd)
-            {
-                return false;
-            }
-        }
+                if (NotHoisted.count(OpInst) == 1) return false;
 
         return true;
     }
@@ -116,57 +80,38 @@ struct LICMPass : public LoopPass
                                    std::vector<Instruction*>& ToHoist)
     {
         for (BasicBlock* BB : L->blocks())
-        {
             for (Instruction& I : *BB)
-            {
                 if (isHoistableInstruction(&I, HoistableLoads, NotHoisted))
-                {
                     ToHoist.push_back(&I);
-                }
                 else
-                {
                     NotHoisted.insert(&I);
-                }
-            }
-        }
     }
 
-    void moveHoistableLoads(BasicBlock* LoopPreheader, const std::vector<Instruction*>& ToHoist)
+    void moveHoistableLoads(BasicBlock* Preheader, const std::vector<Instruction*>& ToHoist)
     {
-        for (Instruction* I : ToHoist)
-        {
-            I->moveBefore(LoopPreheader->getTerminator());
-        }
+        for (Instruction* I : ToHoist) I->moveBefore(Preheader->getTerminator()->getIterator());
     }
 
-    bool runOnLoop(Loop* L, LPPassManager& LPM) override
+    PreservedAnalyses run(Loop& L, LoopAnalysisManager& LAM, LoopStandardAnalysisResults& AR, LPMUpdater&)
     {
-        BasicBlock* LoopPreheader = L->getLoopPreheader();
-        if (LoopPreheader == nullptr)
-        {
-            return false;
-        }
+        BasicBlock* Preheader = L.getLoopPreheader();
+        if (!Preheader) return PreservedAnalyses::all();
 
-        std::unordered_set<Instruction*> HoistableLoads(findHoistableLoads(L));
+        auto HoistableLoads = findHoistableLoads(&L);
         std::unordered_set<Instruction*> NotHoisted;
         std::vector<Instruction*> ToHoist;
 
-        findHoistableInstructions(L, HoistableLoads, NotHoisted, ToHoist);
+        findHoistableInstructions(&L, HoistableLoads, NotHoisted, ToHoist);
+        moveHoistableLoads(Preheader, ToHoist);
 
-        moveHoistableLoads(LoopPreheader, ToHoist);
+        if (ToHoist.empty()) return PreservedAnalyses::all();
 
-        return !ToHoist.empty();
-    }
-
-    void getAnalysisUsage(AnalysisUsage& AU) const override
-    {
-        AU.setPreservesCFG();
-        AU.addRequiredID(LoopSimplifyID);
+        PreservedAnalyses PA;
+        PA.preserveSet<CFGAnalyses>();
+        return PA;
     }
 };
-}  // namespace
 
-char LICMPass::ID = 0;
 std::unordered_set<unsigned int> LICMPass::GoodInstructions = {
     Instruction::Add,     Instruction::Sub,    Instruction::Mul,    Instruction::UDiv,
     Instruction::SDiv,    Instruction::URem,   Instruction::SRem,   Instruction::FAdd,
@@ -177,4 +122,34 @@ std::unordered_set<unsigned int> LICMPass::GoodInstructions = {
     Instruction::FPToUI,  Instruction::FPToSI, Instruction::UIToFP, Instruction::SIToFP,
     Instruction::BitCast, Instruction::ICmp,   Instruction::FCmp,   Instruction::GetElementPtr};
 
-static RegisterPass<LICMPass> X("licm-pass", "The implementation of the LICM pass for the KK project");
+}  // namespace
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo()
+{
+    return {LLVM_PLUGIN_API_VERSION, "LICMPass", LLVM_VERSION_STRING, [](PassBuilder& PB)
+            {
+                PB.registerPipelineParsingCallback(
+                    [](StringRef Name, LoopPassManager& LPM, ArrayRef<PassBuilder::PipelineElement>)
+                    {
+                        if (Name == "licm-pass")
+                        {
+                            LPM.addPass(LICMPass());
+                            return true;
+                        }
+                        return false;
+                    });
+                PB.registerPipelineParsingCallback(
+                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>)
+                    {
+                        if (Name == "licm-pass")
+                        {
+                            FPM.addPass(PromotePass());
+                            LoopPassManager LPM;
+                            LPM.addPass(LICMPass());
+                            FPM.addPass(createFunctionToLoopPassAdaptor(std::move(LPM)));
+                            return true;
+                        }
+                        return false;
+                    });
+            }};
+}
