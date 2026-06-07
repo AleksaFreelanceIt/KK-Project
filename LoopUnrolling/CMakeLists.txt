@@ -1,8 +1,13 @@
-add_llvm_library( LLVMLoopUnrollingPass MODULE
-    LoopUnrollingPass.cpp
+cmake_minimum_required(VERSION 3.20)
+set(CMAKE_CXX_COMPILER clang++)
+project(LoopUnrollingPass)
 
-	DEPENDS
-	intrinsics_gen
-	PLUGIN_TOOL
-	opt
-	)
+find_package(LLVM REQUIRED CONFIG)
+list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
+include(AddLLVM)
+
+add_library(LLVMLoopUnrollingPass MODULE LoopUnrollingPass.cpp)
+target_include_directories(LLVMLoopUnrollingPass PRIVATE ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(LLVMLoopUnrollingPass PRIVATE ${LLVM_DEFINITIONS})
+target_compile_options(LLVMLoopUnrollingPass PRIVATE -fno-rtti)
+set_target_properties(LLVMLoopUnrollingPass PROPERTIES CXX_STANDARD 17)

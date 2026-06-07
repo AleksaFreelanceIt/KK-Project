@@ -1,49 +1,41 @@
-#include "llvm/Pass.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Instruction.h"
-#include "llvm/Transforms/Utils.h"
-#include "llvm/Transforms/Utils/LoopPeel.h"
-#include "llvm/Transforms/Utils/LoopSimplify.h"
-#include "llvm/Transforms/Utils/LoopUtils.h"
-#include "llvm/Transforms/Utils/SizeOpts.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
-#include "llvm/ADT/Statistic.h"
-#include "llvm/Analysis/LoopPass.h"
-#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Plugins/PassPlugin.h"
 
-#include<vector>
-#include<unordered_map>
+#include <vector>
+#include <unordered_map>
 
 using namespace llvm;
 
 namespace {
 
-struct LoopUnrollingPass : public LoopPass {
+static const int UnrollFactor = 3;
+
+struct LoopUnrollingPass : public PassInfoMixin<LoopUnrollingPass> {
     std::vector<BasicBlock *> LoopBasicBlocks;
     std::unordered_map<Value *, Value *> VariablesMap;
-    Value *LoopCounter, *LoopBound;
+    Value *LoopCounter;
     bool isLoopBoundConst;
     int BoundValue;
-    static char ID; // Pass identification, replacement for typeid
-    LoopUnrollingPass() : LoopPass(ID), LoopCounter(nullptr), LoopBound(nullptr), isLoopBoundConst(false), BoundValue(0) {}
+
+    LoopUnrollingPass() : LoopCounter(nullptr), isLoopBoundConst(false), BoundValue(0) {}
 
     void MapVariables(Loop *L) {
         VariablesMap.clear();
-        Function *F = L->getHeader()->getParent(); // uzima funkciju u kojoj se nalazi petlja
+        Function *F = L->getHeader()->getParent();
 
-        for (BasicBlock &BB : *F) {
-            for (Instruction &I : BB) {
-                if (isa<LoadInst>(&I)) { // ako je load mapira se
-                    VariablesMap[&I] = I.getOperand(0); // load -> memorijska adresa iz koje se cita (%x = load i32, ptr %2 => %x->%2)
-                }
-            }
-        }
+        for (BasicBlock &BB : *F)
+            for (Instruction &I : BB)
+                if (isa<LoadInst>(&I))
+                    VariablesMap[&I] = I.getOperand(0);
     }
 
     void findLoopCounterAndBound(Loop *L) {
-        // Resetuje promenjive pre pretrage
         LoopCounter = nullptr;
         isLoopBoundConst = false;
         BoundValue = 0;
@@ -51,9 +43,10 @@ struct LoopUnrollingPass : public LoopPass {
         auto inspectICmp = [&](ICmpInst *CI) {
             ConstantInt *ConstInt = nullptr;
             Value *VarOp = nullptr;
-            for (unsigned op = 0; op < 2; ++op) { // ICMP ima 2 operanda
-                if ((ConstInt = dyn_cast<ConstantInt>(CI->getOperand(op)))) { // gleda jel jedan operand konstanta
-                    VarOp = CI->getOperand(1 - op);  // onda je drugi operand promjenljiva petlje
+
+            for (unsigned op = 0; op < 2; ++op) {
+                if ((ConstInt = dyn_cast<ConstantInt>(CI->getOperand(op)))) {
+                    VarOp = CI->getOperand(1 - op);
                     break;
                 }
             }
@@ -63,10 +56,10 @@ struct LoopUnrollingPass : public LoopPass {
                 BoundValue = ConstInt->getSExtValue();
             }
 
-            if (!VarOp) { // ako nismo direktno nasli promjenljivu prolazimo kroz load/alias mapu
+            if (!VarOp) {
                 for (unsigned op = 0; op < 2; ++op) {
                     Value *Candidate = CI->getOperand(op);
-                    if (isa<LoadInst>(Candidate) || VariablesMap.find(Candidate) != VariablesMap.end()) { // treba nam ili load ili mapirana promjenljiva
+                    if (isa<LoadInst>(Candidate) || VariablesMap.find(Candidate) != VariablesMap.end()) {
                         VarOp = Candidate;
                         break;
                     }
@@ -74,31 +67,27 @@ struct LoopUnrollingPass : public LoopPass {
             }
 
             if (VarOp) {
-                if (LoadInst *LI = dyn_cast<LoadInst>(VarOp)) { // ako je direktan load uzimamo prvi operand
+                if (LoadInst *LI = dyn_cast<LoadInst>(VarOp))
                     LoopCounter = LI->getOperand(0);
-                } else if (VariablesMap.find(VarOp) != VariablesMap.end()) { // ako smo ga nasli u mapiranju trazimo original
+                else if (VariablesMap.find(VarOp) != VariablesMap.end())
                     LoopCounter = VariablesMap[VarOp];
-                } else {
-                    LoopCounter = VarOp; // imamo konstantnu vrijednost
-                }
+                else
+                    LoopCounter = VarOp;
             }
         };
 
-        // pretraga uslova u headeru petlje (ICMP)
         for (Instruction &I : *L->getHeader()) {
             if (ICmpInst *CI = dyn_cast<ICmpInst>(&I)) {
                 inspectICmp(CI);
-                if (LoopCounter)
-                    return;
+                if (LoopCounter) return;
             }
         }
-        // provjera bloka koji ima kraj iteracije petlje (i++)
+
         if (BasicBlock *Latch = L->getLoopLatch()) {
             for (Instruction &I : *Latch) {
                 if (ICmpInst *CI = dyn_cast<ICmpInst>(&I)) {
                     inspectICmp(CI);
-                    if (LoopCounter)
-                        return;
+                    if (LoopCounter) return;
                 }
             }
         }
@@ -107,241 +96,198 @@ struct LoopUnrollingPass : public LoopPass {
             for (Instruction &I : *BB) {
                 if (ICmpInst *CI = dyn_cast<ICmpInst>(&I)) {
                     inspectICmp(CI);
-                    if (LoopCounter)
-                        return;
+                    if (LoopCounter) return;
                 }
             }
         }
     }
 
+    void fullUnrolling1(Loop *L) {
+        std::vector<Instruction *> LoopInstructions;
+        std::unordered_map<Value *, Value *> Mapping;
+        Instruction *Copy;
+        LoadInst *CounterLoad = nullptr;
 
-// za jedan basic block
-// instrukcije ubacujemo u preheader, onda ih multipliciramo i mapiramo da imaju odgovarajuce argumente
-void fullUnrolling1(Loop *L) {
-
-    std::vector<Instruction *> LoopInstructions;
-    std::unordered_map<Value *, Value *> Mapping; // mapiranje originalne instrukcije -> kopija
-    Instruction *Copy;
-    LoadInst *CounterLoad = nullptr;
-
-    BasicBlock *LoopBody = LoopBasicBlocks[1]; // kada radimo sa samo jednim basic blockom(uzimamo tijelo petlje)
-    for (Instruction &I : *LoopBody) { // skupljamo sve instrukcije iz tijela petlje osim terminatora
-        if (!I.isTerminator()) {
-            LoopInstructions.push_back(&I);
-            if (!CounterLoad) { // treba nam instrukcija koja ucitava loopCounter
-                if (auto *LI = dyn_cast<LoadInst>(&I)) {
-                    if (LI->getOperand(0) == LoopCounter)
-                        CounterLoad = LI;
+        BasicBlock *LoopBody = LoopBasicBlocks[1];
+        for (Instruction &I : *LoopBody) {
+            if (!I.isTerminator()) {
+                LoopInstructions.push_back(&I);
+                if (!CounterLoad) {
+                    if (auto *LI = dyn_cast<LoadInst>(&I))
+                        if (LI->getOperand(0) == LoopCounter)
+                            CounterLoad = LI;
                 }
             }
         }
-    }
 
-    Value *BaseCounter = nullptr;
-    // ubacujemo originalni load counter u preheader da bi mogli da pravimo i+1, i+2,...
-    if (CounterLoad) {
-        IRBuilder<> Builder(L->getLoopPreheader()->getTerminator());
-        BaseCounter = Builder.CreateLoad(CounterLoad->getType(), LoopCounter); // generise IR : load i32, ptr %LoopCounter
-    }
+        Value *BaseCounter = nullptr;
+        if (CounterLoad) {
+            IRBuilder<> Builder(L->getLoopPreheader(),L->getLoopPreheader()->getTerminator()->getIterator());
+            BaseCounter = Builder.CreateLoad(CounterLoad->getType(), LoopCounter);
+        }
 
-    // full unroll
-    for (int i = 1; i < BoundValue; i++) { // idemo od 1 jer vec postoji originalno tijelo petlje pa treba da ga kopiramo jos BoundValue - 1 put
-        Value *IterationCounter = nullptr;
-        Mapping.clear(); // ne smijemo da imamo od prethodnih prolaza
-        for (Instruction *I : LoopInstructions) {
-            if (auto *LI = dyn_cast<LoadInst>(I)) {
-                if (LI->getOperand(0) == LoopCounter && BaseCounter) {
-                    if (!IterationCounter) {
-                        if (i == 0) { // prva iteracija koristi originalni counter
-                            IterationCounter = BaseCounter;
-                        } else { // za i=1,2,3... pravimo BaseCounter+i
+        for (int i = 1; i < BoundValue; i++) {
+            Value *IterationCounter = nullptr;
+            Mapping.clear();
+
+            for (Instruction *I : LoopInstructions) {
+                if (auto *LI = dyn_cast<LoadInst>(I)) {
+                    if (LI->getOperand(0) == LoopCounter && BaseCounter) {
+                        if (!IterationCounter) {
                             IterationCounter = BinaryOperator::CreateAdd(
                                 BaseCounter,
-                                ConstantInt::get(BaseCounter->getType(), i)
-                            );
-                            cast<Instruction>(IterationCounter)->insertBefore(LoopBody->getTerminator()); // ubacuje novu instrukciju prije terminatora
+                                ConstantInt::get(BaseCounter->getType(), i));
+                            cast<Instruction>(IterationCounter)->insertBefore(LoopBody->getTerminator()->getIterator());
                         }
+                        Mapping[I] = IterationCounter;
+                        continue;
                     }
-                    Mapping[I] = IterationCounter;
-                    continue;
                 }
-            }
 
-            Copy = I->clone();
-            Copy->insertBefore(LoopBody->getTerminator());
-            Mapping[I] = Copy;
+                Copy = I->clone();
+                Copy->insertBefore(LoopBody->getTerminator()->getIterator());
+                Mapping[I] = Copy;
 
-            for (size_t j = 0; j < Copy->getNumOperands(); j++) { // azuriramo operande (SSA)
-                if (Mapping.find(Copy->getOperand(j)) != Mapping.end()) {
-                    Copy->setOperand(j, Mapping[Copy->getOperand(j)]);
-                }
+                for (size_t j = 0; j < Copy->getNumOperands(); j++)
+                    if (Mapping.find(Copy->getOperand(j)) != Mapping.end())
+                        Copy->setOperand(j, Mapping[Copy->getOperand(j)]);
             }
         }
+
+        LoopBody->getTerminator()->eraseFromParent();
+        L->getLoopPreheader()->splice(L->getLoopPreheader()->getTerminator()->getIterator(), LoopBody);
+        L->getLoopPreheader()->getTerminator()->setSuccessor(0, L->getExitBlock());
+
+        for (BasicBlock *BB : LoopBasicBlocks)
+            BB->eraseFromParent();
     }
 
-    LoopBody->getTerminator()->eraseFromParent(); // moramo da je obrisemo zbog splice-a
-    L->getLoopPreheader()->splice(L->getLoopPreheader()->getTerminator()->getIterator(), LoopBody); // stavlja(kopira) sve instrukcije iz LoopBody prije terminirajuce instrukcije(ubacuje novo tijelo petlje direktno u preheader)
-    L->getLoopPreheader()->getTerminator()->setSuccessor(0, L->getExitBlock()); // preheader sad treba da pokazuje na prvi basic block van granica pretlje
+    void duplicateLoopBody(std::vector<BasicBlock *> LoopBodyBasicBlocks, int numOfTimes, BasicBlock *InsertBefore) {
+        std::unordered_map<Value *, Value *> Mapping;
+        std::unordered_map<Value *, Value *> LoadMapping;
+        std::unordered_map<BasicBlock *, BasicBlock *> BlocksMapping;
 
-    // brisemo petlju jer nam ne treba vise
-    for (BasicBlock *BB : LoopBasicBlocks) {
-        BB->eraseFromParent();
-    }
-}
+        IRBuilder<> Builder(InsertBefore->getContext());
+        Instruction *Copy;
+        BasicBlock *LastFromPreviousCopy = LoopBodyBasicBlocks.back();
+        std::vector<BasicBlock *> LoopBodyBasicBlockCopy;
 
-// prvo brisemo basic block koji predstavlja provjeru uslova i basic block koji skace na pocetak petlje i azurira brojac
-// ostaju nam oni koji predstavljaju tijelo petlje i n-1 put ga kopiramo
-// poslednji basic block treba da pokazuje na exit basic block i svaki block treba da pokazuje na pocetak narednog
-void duplicateLoopBody(std::vector<BasicBlock *> LoopBodyBasicBlocks, int numOfTimes, BasicBlock *InsertBefore) { // InsertBefore prosljedjujemo da znamo gdje treba posljednja instrukcija da se preusmjeri (na izlaz)
-    std::unordered_map<Value *, Value *> Mapping; // za mapiranje originalnih instrukcija u njihove kopije
-    std::unordered_map<Value *, Value *> LoadMapping; // kada imamo load loop brojaca da bi za svaku kopiju imali i+1, i+2,... (kada u tijelu petlje imamo npr a[i]=i LoadMapping nam treba za to i)
-    std::unordered_map<BasicBlock *, BasicBlock *> BlocksMapping; // mapiranje originalnih basic blockova u kopije
+        for (int i = 0; i < numOfTimes; i++) {
+            LoopBodyBasicBlockCopy.clear();
+            Mapping.clear();
+            LoadMapping.clear();
+            BlocksMapping.clear();
 
-    IRBuilder<> Builder(InsertBefore->getContext()); // za ubacivanje novih instrukcija
+            for (size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
+                BasicBlock *NewBasicBlock = BasicBlock::Create(InsertBefore->getContext(), "", InsertBefore->getParent(), InsertBefore);
+                LoopBodyBasicBlockCopy.push_back(NewBasicBlock);
+                BlocksMapping[LoopBodyBasicBlocks[j]] = NewBasicBlock;
+            }
 
-    Instruction *Copy;
-    BasicBlock *LastFromPreviousCopy = LoopBodyBasicBlocks.back(); // kako bi znali na sta da prebacimo da pokazuje(poslednji blok prethodne kopije da bismo ga povezali sa sledecom kopijom)
+            for (size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
+                Builder.SetInsertPoint(LoopBodyBasicBlockCopy[j]);
 
-    std::vector<BasicBlock *> LoopBodyBasicBlockCopy; // cuva sve blokove jedne nove kopije
+                for (Instruction &I : *LoopBodyBasicBlocks[j]) {
+                    Copy = I.clone();
+                    Builder.Insert(Copy);
 
-    for(int i = 0; i < numOfTimes; i++) {
-        LoopBodyBasicBlockCopy.clear();
-        Mapping.clear();
-        LoadMapping.clear();
-        BlocksMapping.clear();
-
-        // napravimo prazne kopije Basic Blockova jer njih ne mozemo samo da kopiramo vec napravimo prazne i kopiramo u njih pojedinacne instrukcije
-        for(size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
-            BasicBlock *NewBasicBlock = BasicBlock::Create(InsertBefore->getContext(), "", InsertBefore->getParent(), InsertBefore);
-
-            LoopBodyBasicBlockCopy.push_back(NewBasicBlock);
-
-            BlocksMapping[LoopBodyBasicBlocks[j]] = NewBasicBlock; // sluzi za kasnije prevezivanje basic blockova (ono sa A->B i A'->B)
-        }
-
-        // svaku originalnu instrukciju iz originalnog basic blocka iskopiramo u copy block
-        for(size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
-            Builder.SetInsertPoint(LoopBodyBasicBlockCopy[j]); // smestaju se na kraj basic blocka
-
-            for(Instruction &I : *LoopBodyBasicBlocks[j]) {
-                Copy = I.clone();
-                Builder.Insert(Copy);
-                // pravljenje i+1, i+2,... ako je load loop brojaca
-                if(isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                    Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(Copy,
-                                                       ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
-                    Add->insertAfter(Copy); // ubacuje se odmah poslije load
-                    LoadMapping[Copy] = Add; // zapamti mapiranje
-                }
-                Mapping[&I] = Copy; // original -> kopija
-
-                for(size_t k = 0; k < Copy->getNumOperands(); k++) { // popravlja operande
-                    if(Mapping.find(Copy->getOperand(k)) != Mapping.end()) { // ako operand koristi vec kopiranu funkciju
-                        Copy->setOperand(k, Mapping[Copy->getOperand(k)]);
+                    if (isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
+                        Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(
+                            Copy, ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i + 1));
+                        Add->insertAfter(Copy);
+                        LoadMapping[Copy] = Add;
                     }
-                    if(LoadMapping.find(Copy->getOperand(k)) != LoadMapping.end()) { // ako koristi load
-                        Copy->setOperand(k, LoadMapping[Copy->getOperand(k)]);
+
+                    Mapping[&I] = Copy;
+
+                    for (size_t k = 0; k < Copy->getNumOperands(); k++) {
+                        if (Mapping.find(Copy->getOperand(k)) != Mapping.end())
+                            Copy->setOperand(k, Mapping[Copy->getOperand(k)]);
+                        if (LoadMapping.find(Copy->getOperand(k)) != LoadMapping.end())
+                            Copy->setOperand(k, LoadMapping[Copy->getOperand(k)]);
                     }
                 }
             }
-        }
-        // povezivanje blokova unutar nove kopije
-        for(size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
-            for(size_t k = 0; k < LoopBodyBasicBlockCopy[j]->getTerminator()->getNumSuccessors(); k++) {
-                BasicBlock *Succ = LoopBodyBasicBlocks[j]->getTerminator()->getSuccessor(k);
 
-                if(BlocksMapping.find(Succ) != BlocksMapping.end()) { // gledamo da li postoji mapiranje uopste jer ako ne postoji onda je to poslednji basic block tijela petlje i on nije mapiran ni u sta(pa ako postoji preveze se)
-                    // k-tog suksesora postavlja na ono u sta se mapira dati suksesor originalnog basic blocka
-                    LoopBodyBasicBlockCopy[j]->getTerminator()->setSuccessor(k, BlocksMapping[Succ]);
+            for (size_t j = 0; j < LoopBodyBasicBlocks.size(); j++) {
+                if (!LoopBodyBasicBlockCopy[j]->getTerminator()) continue;
+                for (size_t k = 0; k < LoopBodyBasicBlockCopy[j]->getTerminator()->getNumSuccessors(); k++) {
+                    BasicBlock *Succ = LoopBodyBasicBlocks[j]->getTerminator()->getSuccessor(k);
+                    if (BlocksMapping.find(Succ) != BlocksMapping.end())
+                        LoopBodyBasicBlockCopy[j]->getTerminator()->setSuccessor(k, BlocksMapping[Succ]);
+                }
+            }
+
+            LastFromPreviousCopy->getTerminator()->setSuccessor(0, LoopBodyBasicBlockCopy.front());
+            LastFromPreviousCopy = LoopBodyBasicBlockCopy.back();
+        }
+
+        if (!LoopBodyBasicBlockCopy.empty())
+            LoopBodyBasicBlockCopy.back()->getTerminator()->setSuccessor(0, InsertBefore);
+    }
+
+    void fullUnrolling(Loop *L) {
+        BasicBlock *Exit = L->getExitBlock();
+
+        std::vector<BasicBlock *> LoopBodyBlocks(LoopBasicBlocks.size() - 2);
+        std::copy(LoopBasicBlocks.begin() + 1, LoopBasicBlocks.end() - 1, LoopBodyBlocks.begin());
+
+        L->getLoopPreheader()->getTerminator()->setSuccessor(0, LoopBodyBlocks.front());
+        LoopBodyBlocks.back()->getTerminator()->setSuccessor(0, Exit);
+
+        duplicateLoopBody(LoopBodyBlocks, BoundValue - 1, Exit);
+
+        LoopBasicBlocks.front()->eraseFromParent();
+        LoopBasicBlocks.back()->eraseFromParent();
+    }
+
+    void partialUnrolling1(Loop *L) {
+        std::vector<Instruction *> LoopInstructions;
+        std::unordered_map<Value *, Value *> Mapping;
+        std::unordered_map<Value *, Value *> LoadMapping;
+        BasicBlock *LoopBody = LoopBasicBlocks[1];
+
+        for (Instruction &I : *LoopBody)
+            if (!I.isTerminator())
+                LoopInstructions.push_back(&I);
+
+        Instruction *Copy;
+
+        for (int i = 0; i < UnrollFactor - 1; i++) {
+            Mapping.clear();
+            LoadMapping.clear();
+
+            for (Instruction *I : LoopInstructions) {
+                Copy = I->clone();
+                Copy->insertBefore(LoopBody->getTerminator()->getIterator());
+
+                if (isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
+                    Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(
+                        Copy, ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i + 1));
+                    Add->insertAfter(Copy);
+                    LoadMapping[Copy] = Add;
+                }
+
+                Mapping[I] = Copy;
+
+                for (size_t j = 0; j < Copy->getNumOperands(); j++) {
+                    if (Mapping.find(Copy->getOperand(j)) != Mapping.end())
+                        Copy->setOperand(j, Mapping[Copy->getOperand(j)]);
+                    if (LoadMapping.find(Copy->getOperand(j)) != LoadMapping.end())
+                        Copy->setOperand(j, LoadMapping[Copy->getOperand(j)]);
                 }
             }
         }
-        // povezivanje sa prethodnom kopijom
-       LastFromPreviousCopy->getTerminator()->setSuccessor(0, LoopBodyBasicBlockCopy.front()); // prevezali smo prvi
-       LastFromPreviousCopy = LoopBodyBasicBlockCopy.back(); // prevezan je poslednji
-    }
-    if(!LoopBodyBasicBlockCopy.empty()) {
-        LoopBodyBasicBlockCopy.back()->getTerminator()->setSuccessor(0, InsertBefore); // prevezan je poslednji basic block tako da pokazuje na exit basic block
-    }
-}
 
-// kada imamo vise basic blockova
-void fullUnrolling(Loop *L) {
-    BasicBlock *Preheader = L->getLoopPreheader(); // block prije ulaska u petlju (ima inicijalizacije,...)
-    BasicBlock *Exit = L->getExitBlock(); // block poslije izlaska iz petlje
-
-    std::vector<BasicBlock*> LoopBodyBlocks(LoopBasicBlocks.size() - 2); // svi basic blockovi bez prvog i poslednjeg (preheader i azuriranje)
-    std::copy(LoopBasicBlocks.begin() + 1, LoopBasicBlocks.end()-1, LoopBodyBlocks.begin());
-
-    Preheader->getTerminator()->setSuccessor(0, LoopBodyBlocks.front()); // preheader sada ulazi direktno u originalno tijelo petlje
-
-    LoopBodyBlocks.back()->getTerminator()->setSuccessor(0, Exit); // posljednji originalni block pokazuje na exit
-
-    duplicateLoopBody(LoopBodyBlocks, BoundValue-1, Exit); // napravi BoundValue - 1 kopiju (jer jednu vec imamo - original)
-
-    LoopBasicBlocks.front()->eraseFromParent(); // obrise header
-    LoopBasicBlocks.back()->eraseFromParent(); // obrise poslednji blok
-}
-
-
-
-
-// kada imamo jedan basic block
-void partialUnrolling1(Loop *L) {
-    std::vector<Instruction *> LoopInstructions;
-    std::unordered_map<Value *, Value *> Mapping;
-    std::unordered_map<Value *, Value *> LoadMapping; // treba nam da zapamtimo gdje koristimo counter i da ga sacuvamo (ako imamo a[i]=i treba nam da imamo +1, +2,...)
-    BasicBlock *LoopBody = LoopBasicBlocks[1];
-
-    for(Instruction &I : *LoopBody) {
-        if(!I.isTerminator()) {
-            LoopInstructions.push_back(&I);
-        }
-    }
-
-    int Factor = 3;
-
-    Instruction *Copy;
-
-    for(int i = 0; i < Factor-1; i++) { // Factor - 1 jer vec postoji originalno tijelo petlje
-        // Očistimo mapiranje pre svake kopije da novi klon koristi vrednosti
-        // iz te kopije, a ne iz prethodnih unroldovanih iteracija.
-        Mapping.clear();
-        LoadMapping.clear();
-
-        for(Instruction *I : LoopInstructions) {
-            Copy = I->clone();
-            Copy->insertBefore(LoopBody->getTerminator());
-
-            if(isa<LoadInst>(Copy) && Copy->getOperand(0) == LoopCounter) {
-                Instruction *Add = (Instruction*) BinaryOperator::CreateAdd(Copy,
-                                                  ConstantInt::get(Type::getInt32Ty(Copy->getContext()), i+1));
-
-                Add->insertAfter(Copy);
-                LoadMapping[Copy] = Add;
-            }
-            Mapping[I] = Copy;
-
-            for(size_t j = 0; j < Copy->getNumOperands(); j++) {
-                if(Mapping.find(Copy->getOperand(j)) != Mapping.end()) {
-                    Copy->setOperand(j, Mapping[Copy->getOperand(j)]);
-                }
-                if(LoadMapping.find(Copy->getOperand(j)) != LoadMapping.end()) {
-                    Copy->setOperand(j, LoadMapping[Copy->getOperand(j)]);
-                }
-            }
-        }
-    }
-    // Updejtujemo inkrement u latch bloku tako da petlja napreduje za Faktor umesto za 1.
-    if (BasicBlock *Latch = L->getLoopLatch()) {
-        for (Instruction &I : *Latch) {
-            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-                if (BO->getOpcode() == Instruction::Add) {
-                    if (auto *LI = dyn_cast<LoadInst>(BO->getOperand(0))) {
-                        if (LI->getOperand(0) == LoopCounter) {
-                            if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
-                                if (C->getSExtValue() == 1) {
-                                    BO->setOperand(1, ConstantInt::get(C->getType(), Factor));
+        if (BasicBlock *Latch = L->getLoopLatch()) {
+            for (Instruction &I : *Latch) {
+                if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                    if (BO->getOpcode() == Instruction::Add) {
+                        if (auto *LI = dyn_cast<LoadInst>(BO->getOperand(0))) {
+                            if (LI->getOperand(0) == LoopCounter) {
+                                if (auto *C = dyn_cast<ConstantInt>(BO->getOperand(1))) {
+                                    if (C->getSExtValue() == 1)
+                                        BO->setOperand(1, ConstantInt::get(C->getType(), UnrollFactor));
                                 }
                             }
                         }
@@ -350,160 +296,155 @@ void partialUnrolling1(Loop *L) {
             }
         }
     }
-}
 
-BasicBlock* copyLoop(Loop *L) {
-    BasicBlock *Exit = L->getExitBlock();
-    std::unordered_map<Value *, Value *> Mapping;
-    std::unordered_map<BasicBlock *, BasicBlock *> BlocksMapping;
-    IRBuilder<> Builder(Exit->getContext()); // uzimamo neki basic block za koji znamo da sigurno postoji
-    Instruction *Copy;
-    std::vector<BasicBlock *> LoopBasicBlockCopy;
+    BasicBlock* copyLoop(Loop *L) {
+        BasicBlock *Exit = L->getExitBlock();
+        std::unordered_map<Value *, Value *> Mapping;
+        std::unordered_map<BasicBlock *, BasicBlock *> BlocksMapping;
+        IRBuilder<> Builder(Exit->getContext());
+        Instruction *Copy;
+        std::vector<BasicBlock *> LoopBasicBlockCopy;
 
-    for(size_t j = 0; j < LoopBasicBlocks.size(); j++) { // pravimo prazne basic blockove onoliko koliko ih je bilo u telu petlje(prazne jer ne mozemo da kopiramo basic blockove vec napravimo prazne i kopiramo instrukcije u njih)
-        BasicBlock *NewBasicBlock = BasicBlock::Create(Exit->getContext(), "", Exit->getParent(), Exit);
-        LoopBasicBlockCopy.push_back(NewBasicBlock);
-        BlocksMapping[LoopBasicBlocks[j]] = NewBasicBlock; // sluzi za kasnije prevezivanje basic blockova (ono sa A->B i A'->B)
-    }
+        for (size_t j = 0; j < LoopBasicBlocks.size(); j++) {
+            BasicBlock *NewBasicBlock = BasicBlock::Create(Exit->getContext(), "", Exit->getParent(), Exit);
+            LoopBasicBlockCopy.push_back(NewBasicBlock);
+            BlocksMapping[LoopBasicBlocks[j]] = NewBasicBlock;
+        }
 
-    for(size_t j = 0; j < LoopBasicBlocks.size(); j++) {
-        Builder.SetInsertPoint(LoopBasicBlockCopy[j]);
+        for (size_t j = 0; j < LoopBasicBlocks.size(); j++) {
+            Builder.SetInsertPoint(LoopBasicBlockCopy[j]);
 
-        for(Instruction &I : *LoopBasicBlocks[j]) {
-            Copy = I.clone();
-            Builder.Insert(Copy);
-            Mapping[&I] = Copy;
+            for (Instruction &I : *LoopBasicBlocks[j]) {
+                Copy = I.clone();
+                Builder.Insert(Copy);
+                Mapping[&I] = Copy;
 
-            for(size_t k = 0; k < Copy->getNumOperands(); k++) {
-                if(Mapping.find(Copy->getOperand(k)) != Mapping.end()) {
-                    Copy->setOperand(k, Mapping[Copy->getOperand(k)]);
-                }
+                for (size_t k = 0; k < Copy->getNumOperands(); k++)
+                    if (Mapping.find(Copy->getOperand(k)) != Mapping.end())
+                        Copy->setOperand(k, Mapping[Copy->getOperand(k)]);
             }
         }
+
+        for (size_t j = 0; j < LoopBasicBlocks.size(); j++) {
+            if (!LoopBasicBlockCopy[j]->getTerminator()) continue;
+            for (size_t k = 0; k < LoopBasicBlocks[j]->getTerminator()->getNumSuccessors(); k++)
+                if (BlocksMapping.find(LoopBasicBlocks[j]->getTerminator()->getSuccessor(k)) != BlocksMapping.end())
+                    LoopBasicBlockCopy[j]->getTerminator()->setSuccessor(k, BlocksMapping[LoopBasicBlocks[j]->getTerminator()->getSuccessor(k)]);
+        }
+
+        return LoopBasicBlockCopy.front();
     }
-    for(size_t j = 0; j < LoopBasicBlocks.size(); j++) {
-        for(size_t k = 0; k < LoopBasicBlocks[j]->getTerminator()->getNumSuccessors(); k++) {
-            if(BlocksMapping.find(LoopBasicBlocks[j]->getTerminator()->getSuccessor(k)) != BlocksMapping.end()) {
-                LoopBasicBlockCopy[j]->getTerminator()->setSuccessor(k, BlocksMapping[LoopBasicBlocks[j]->getTerminator()->getSuccessor(k)]);
+
+    void partialUnrolling(Loop *L) {
+        BasicBlock *JumpTo = copyLoop(L);
+
+        std::vector<BasicBlock *> LoopBodyBasicBlocks(LoopBasicBlocks.size() - 2);
+        std::copy(LoopBasicBlocks.begin() + 1, LoopBasicBlocks.end() - 1, LoopBodyBasicBlocks.begin());
+
+        duplicateLoopBody(LoopBodyBasicBlocks, UnrollFactor - 1, LoopBasicBlocks.back());
+
+        LoopBasicBlocks.front()->getTerminator()->setSuccessor(1, JumpTo);
+
+        for (Instruction &I : *LoopBasicBlocks.front()) {
+            if (isa<LoadInst>(&I) && I.getOperand(0) == LoopCounter) {
+                Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(
+                    &I, ConstantInt::get(Type::getInt32Ty(I.getContext()), UnrollFactor - 1));
+                Add->insertAfter(&I);
+                I.replaceUsesWithIf(Add, [Add](Use &U) {
+                    return U.getUser() != Add;
+                });
             }
         }
-    }
-    return LoopBasicBlockCopy.front();
-}
 
-void partialUnrolling(Loop *L) {
-    int Factor = 3;
-
-    BasicBlock *JumpTo = copyLoop(L);
-
-    std::vector<BasicBlock *> LoopBodyBasicBlocks(LoopBasicBlocks.size()-2);
-    std::copy(LoopBasicBlocks.begin()+1, LoopBasicBlocks.end()-1, LoopBodyBasicBlocks.begin());
-
-    duplicateLoopBody(LoopBodyBasicBlocks, Factor-1, LoopBasicBlocks.back());
-
-    LoopBasicBlocks.front()->getTerminator()->setSuccessor(1, JumpTo);
-
-    for(Instruction &I : *LoopBasicBlocks.front()) {
-        // mi pretpostavljamo da je i uvijek prvi operand
-        if(isa<LoadInst>(&I) && I.getOperand(0) == LoopCounter) {
-            Instruction *Add = (Instruction *) BinaryOperator::CreateAdd(&I, ConstantInt::get(Type::getInt32Ty(I.getContext()), Factor-1));
-            Add->insertAfter(&I);
-            I.replaceUsesWithIf(Add, [Add](Use &U) {
-               return U.getUser() != Add;
-            });
-        }
-    }
-
-    for (Instruction &I : *LoopBasicBlocks.back()) {
-        if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
-            if (BO->getOpcode() == Instruction::Add) {
-                if (auto *LI = dyn_cast<LoadInst>(BO->getOperand(0))) {
-                    if (LI->getOperand(0) == LoopCounter) {
-                        BO->setOperand(1, ConstantInt::get(Type::getInt32Ty(I.getContext()), Factor));
+        for (Instruction &I : *LoopBasicBlocks.back()) {
+            if (auto *BO = dyn_cast<BinaryOperator>(&I)) {
+                if (BO->getOpcode() == Instruction::Add) {
+                    if (auto *LI = dyn_cast<LoadInst>(BO->getOperand(0))) {
+                        if (LI->getOperand(0) == LoopCounter)
+                            BO->setOperand(1, ConstantInt::get(Type::getInt32Ty(I.getContext()), UnrollFactor));
                     }
                 }
             }
         }
     }
-}
 
-void unrollLoop(Loop *L) {
-    if(isLoopBoundConst) {
-		if(LoopBasicBlocks.size() == 3) {
-			fullUnrolling1(L);
-		} else {
-        	fullUnrolling(L);
-		}
-    } else {
-		if(LoopBasicBlocks.size() == 3) {
-			partialUnrolling1(L);
-		} else {
-        	partialUnrolling(L);
-		}
+    void unrollLoop(Loop *L) {
+        if (isLoopBoundConst) {
+            if (LoopBasicBlocks.size() == 3)
+                fullUnrolling1(L);
+            else
+                fullUnrolling(L);
+        } else {
+            if (LoopBasicBlocks.size() == 3)
+                partialUnrolling1(L);
+            else
+                partialUnrolling(L);
+        }
     }
-}
 
-//Debug f-ja
-void debugPrintLoopInfo(Loop *L) {
-    errs() << "[OurUnroll] Running on loop in function: "
-           << L->getHeader()->getParent()->getName() << "\n";
-    errs() << "[OurUnroll] Header: " << L->getHeader()->getName()
-           << ", blocks: " << L->getBlocks().size() << "\n";
-    errs() << "[OurUnroll] isLoopBoundConst=" << isLoopBoundConst
-           << " BoundValue=" << BoundValue << "\n";
-    errs() << "[OurUnroll] LoopCounter: ";
-    if (LoopCounter) {
-        LoopCounter->print(errs());
+    void debugPrintLoopInfo(Loop *L) {
+        errs() << "[OurUnroll] Running on loop in function: "
+               << L->getHeader()->getParent()->getName() << "\n";
+        errs() << "[OurUnroll] Header: " << L->getHeader()->getName()
+               << ", blocks: " << L->getBlocks().size() << "\n";
+        errs() << "[OurUnroll] isLoopBoundConst=" << isLoopBoundConst
+               << " BoundValue=" << BoundValue << "\n";
+        errs() << "[OurUnroll] LoopCounter: ";
+        if (LoopCounter)
+            LoopCounter->print(errs());
+        else
+            errs() << "<null>";
         errs() << "\n";
-    } else {
-        errs() << "<null>\n";
     }
-}
 
-// pravimo pretpopstavku da ukoliko se brojac mijenja bilo gdje u petlji tada necemo da radimo unrolling
-bool isLoopCounterModifiedInBody(Loop *L, Value *LoopCounter) {
-	if(!LoopCounter) {
-		return false;
-	}
-	BasicBlock *Header = L->getHeader(); // uslov petlje
-	BasicBlock *Latch = L->getLoopLatch(); // i++
+    bool isLoopCounterModifiedInBody(Loop *L, Value *LoopCounter) {
+        if (!LoopCounter) return false;
 
-	for(BasicBlock *BB : L->blocks()) {
-		if(BB == Header) { // necemo da gledamo header (provjera uslova)
-			continue;
-		}
-		if(BB == Latch) { // ovdje je i++ tkd necemo da prekidamo kada se tu mijenja
-			continue;
-		}
+        BasicBlock *Header = L->getHeader();
+        BasicBlock *Latch = L->getLoopLatch();
 
-		for(Instruction &I : *BB) {
-			if(auto *Store = dyn_cast<StoreInst>(&I)) {
-				Value *StoredAddress = Store->getPointerOperand(); // uzimamo adresu u koju store upisuje
-				if(StoredAddress == LoopCounter) { // ako se upisuje bas u memoriju LoopCountera znaci da se mijenja brojac u tijelu
-					return true;
-				}
-			}
-		}
-	}
-	return false;
-}
+        for (BasicBlock *BB : L->blocks()) {
+            if (BB == Header || BB == Latch) continue;
 
-    // LPM mi necemo koristiti ali se prosledjuje kao parametar
-    bool runOnLoop(Loop *L, LPPassManager &LPM) override {
-
-        LoopBasicBlocks = L->getBlocksVector();
-        MapVariables(L);
-        findLoopCounterAndBound(L);
-		if(isLoopCounterModifiedInBody(L, LoopCounter)) {
-			errs() << "Loop counter is modified inside loop body. Loop unrolling won't be done!\n";
-			exit(1);
-		}
-        unrollLoop(L);
-        //debugPrintLoopInfo(L);
-        return true;
+            for (Instruction &I : *BB) {
+                if (auto *Store = dyn_cast<StoreInst>(&I))
+                    if (Store->getPointerOperand() == LoopCounter)
+                        return true;
+            }
+        }
+        return false;
     }
-  };
-}
 
-char LoopUnrollingPass::ID = 0;
-static RegisterPass<LoopUnrollingPass> X("loop-unrolling", "Our simple loop unrolling pass", false, false);
+    PreservedAnalyses run(Loop &L, LoopAnalysisManager &LAM,
+                          LoopStandardAnalysisResults &AR, LPMUpdater &) {
+        LoopBasicBlocks = L.getBlocksVector();
+        MapVariables(&L);
+        findLoopCounterAndBound(&L);
+
+        if (isLoopCounterModifiedInBody(&L, LoopCounter)) {
+            errs() << "Loop counter is modified inside loop body. Loop unrolling won't be done!\n";
+            return PreservedAnalyses::all();
+        }
+
+        unrollLoop(&L);
+        return PreservedAnalyses::none();
+    }
+};
+
+} // namespace
+
+extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo()
+{
+    return {LLVM_PLUGIN_API_VERSION, "LoopUnrollingPass", LLVM_VERSION_STRING,
+            [](PassBuilder &PB) {
+                PB.registerPipelineParsingCallback(
+                    [](StringRef Name, LoopPassManager &LPM,
+                       ArrayRef<PassBuilder::PipelineElement>) {
+                        if (Name == "loop-unrolling") {
+                            LPM.addPass(LoopUnrollingPass());
+                            return true;
+                        }
+                        return false;
+                    });
+            }};
+}
