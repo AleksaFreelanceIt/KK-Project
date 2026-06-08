@@ -1,4 +1,4 @@
-# LLVM Loop Unrolling Pass
+# LLVM LICM & Loop Unrolling Pass
 
 Out-of-tree LLVM pass implementing loop unrolling, designed to run after LICM.
 
