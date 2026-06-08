@@ -440,7 +440,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo llvmGetPassPluginIn
                 PB.registerPipelineParsingCallback(
                     [](StringRef Name, LoopPassManager &LPM,
                        ArrayRef<PassBuilder::PipelineElement>) {
-                        if (Name == "loop-unrolling") {
+                        if (Name == "loop-unrolling-pass") {
                             LPM.addPass(LoopUnrollingPass());
                             return true;
                         }
