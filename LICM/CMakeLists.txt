@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.20)
 set(CMAKE_CXX_COMPILER clang++)
 project(LICMPass)
 
+execute_process(
+    COMMAND llvm-config --cmakedir
+    OUTPUT_VARIABLE LLVM_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 find_package(LLVM REQUIRED CONFIG)
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 include(AddLLVM)
