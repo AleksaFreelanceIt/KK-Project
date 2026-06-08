@@ -21,7 +21,7 @@ Run LICM pass:
 
 Run Loop Unrolling pass:
 ```bash
-./bin/opt -enable-new-pm=0 -load lib/LLVMLoopUnrollingPass.so -loop-unrolling example.ll -S -o example_out.ll
+./bin/opt -enable-new-pm=0 -load lib/LLVMLoopUnrollingPass.so -loop-unrolling-pass example.ll -S -o example_out.ll
 ```
 
 Run both passes:
@@ -29,5 +29,5 @@ Run both passes:
 ./bin/opt -enable-new-pm=0 \
     -load lib/LLVMLicmPass.so \
     -load lib/LLVMLoopUnrollingPass.so \
-    -licm-pass -loop-unrolling example.ll -S -o example_out.ll
+    -licm-pass -loop-unrolling-pass example.ll -S -o example_out.ll
 ```

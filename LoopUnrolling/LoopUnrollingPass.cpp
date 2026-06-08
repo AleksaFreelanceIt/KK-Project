@@ -506,4 +506,4 @@ bool isLoopCounterModifiedInBody(Loop *L, Value *LoopCounter) {
 }
 
 char LoopUnrollingPass::ID = 0;
-static RegisterPass<LoopUnrollingPass> X("loop-unrolling", "Our simple loop unrolling pass", false, false);
+static RegisterPass<LoopUnrollingPass> X("loop-unrolling-pass", "Our simple loop unrolling pass", false, false);
